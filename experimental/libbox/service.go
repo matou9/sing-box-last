@@ -2,8 +2,8 @@ package libbox
 
 import (
 	"context"
+	"fmt"
 	"net/netip"
-	"os"
 	"runtime"
 	runtimeDebug "runtime/debug"
 	"sync"
@@ -27,7 +27,15 @@ import (
 	"github.com/sagernet/sing/common/logger"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/service"
+	"github.com/sagernet/sing/service/filemanager"
 	"github.com/sagernet/sing/service/pause"
+)
+
+// 全局状态管理（极简）
+var (
+	mobileCreateMu sync.Mutex   // 创建互斥锁
+	currentCancel  sync.Map     // 当前创建的取消函数，用 "cancel" key
+	lastService    sync.Map     // 上一个服务实例，用 "service" key
 )
 
 type BoxService struct {
@@ -39,6 +47,119 @@ type BoxService struct {
 	pauseManager          pause.Manager
 
 	iOSPauseFields
+}
+
+func NewGuiChaoService(options option.Options) (*BoxService, error) {
+	ctx, cancel := context.WithCancel(BaseContext(nil))
+	ctx = filemanager.WithDefault(ctx, sWorkingPath, sTempPath, sUserID, sGroupID)
+	urlTestHistoryStorage := urltest.NewHistoryStorage()
+	ctx = service.ContextWithPtr(ctx, urlTestHistoryStorage)
+	service.MustRegister[deprecated.Manager](ctx, new(deprecatedManager))
+	runtimeDebug.FreeOSMemory()
+	instance, err := box.New(box.Options{
+		Context: ctx,
+		Options: options,
+	})
+	if err != nil {
+		cancel()
+		return nil, E.Cause(err, "create service")
+	}
+	runtimeDebug.FreeOSMemory()
+	return &BoxService{
+		ctx:                   ctx,
+		cancel:                cancel,
+		instance:              instance,
+		urlTestHistoryStorage: urlTestHistoryStorage,
+		pauseManager:          service.FromContext[pause.Manager](ctx),
+		clashServer:           service.FromContext[adapter.ClashServer](ctx),
+	}, nil
+}
+
+func NewMobileService(configContent string, platformInterface PlatformInterface) (*BoxService, error) {
+	// === 步骤1: 获取锁，清理旧资源 ===
+	mobileCreateMu.Lock()
+
+	// 取消上一次创建（如果还在进行中）
+	if oldCancelVal, ok := currentCancel.Load("cancel"); ok {
+		if oldCancel, ok := oldCancelVal.(context.CancelFunc); ok {
+			oldCancel()
+		}
+		currentCancel.Delete("cancel")
+	}
+
+	// 关闭上一个服务实例（异步，不阻塞）
+	if oldServiceVal, ok := lastService.Load("service"); ok {
+		if oldService, ok := oldServiceVal.(*BoxService); ok {
+			go func() {
+				closeDone := make(chan struct{})
+				go func() {
+					oldService.Close()
+					close(closeDone)
+				}()
+				select {
+				case <-closeDone:
+				case <-time.After(5 * time.Second):
+				}
+				runtimeDebug.FreeOSMemory()
+			}()
+		}
+		lastService.Delete("service")
+	}
+
+	// 创建新的Context（带20秒超时）
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	currentCancel.Store("cancel", cancel)
+
+	mobileCreateMu.Unlock()
+
+	// === 步骤2: 异步创建服务 ===
+	type result struct {
+		service *BoxService
+		err     error
+	}
+	done := make(chan result, 1)
+
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				done <- result{nil, fmt.Errorf("panic in NewService: %v", r)}
+			}
+		}()
+		svc, err := NewService(configContent, platformInterface)
+		done <- result{svc, err}
+	}()
+
+	// === 步骤3: 等待结果、超时或取消 ===
+	select {
+	case res := <-done:
+		cancel()
+		currentCancel.Delete("cancel")
+		if res.err != nil {
+			return nil, res.err
+		}
+		lastService.Store("service", res.service)
+		return res.service, nil
+	case <-ctx.Done():
+		go func() {
+			res := <-done
+			if res.service != nil {
+				cleanupDone := make(chan struct{})
+				go func() {
+					res.service.Close()
+					close(cleanupDone)
+				}()
+				select {
+				case <-cleanupDone:
+				case <-time.After(8 * time.Second):
+				}
+			}
+			runtimeDebug.FreeOSMemory()
+		}()
+		if ctx.Err() == context.DeadlineExceeded {
+			return nil, fmt.Errorf("service creation timeout after 20s")
+		}
+		return nil, fmt.Errorf("service creation cancelled")
+	}
 }
 
 func NewService(configContent string, platformInterface PlatformInterface) (*BoxService, error) {
@@ -105,9 +226,40 @@ func (s *BoxService) Close() error {
 	case <-done:
 		return err
 	case <-time.After(C.FatalStopTimeout):
-		os.Exit(1)
-		return nil
+		return fmt.Errorf("close timeout after %v", C.FatalStopTimeout)
 	}
+}
+
+// CancelCurrentCreation 取消当前正在进行的创建（如果有）
+func CancelCurrentCreation() bool {
+	if cancelVal, ok := currentCancel.Load("cancel"); ok {
+		if cancel, ok := cancelVal.(context.CancelFunc); ok {
+			cancel()
+			return true
+		}
+	}
+	return false
+}
+
+// HasActiveService 检查是否有活跃的服务实例
+func HasActiveService() bool {
+	val, ok := lastService.Load("service")
+	if !ok {
+		return false
+	}
+	_, ok = val.(*BoxService)
+	return ok
+}
+
+// CloseActiveService 关闭当前活跃的服务实例
+func CloseActiveService() error {
+	if svcVal, ok := lastService.Load("service"); ok {
+		if svc, ok := svcVal.(*BoxService); ok {
+			lastService.Delete("service")
+			return svc.Close()
+		}
+	}
+	return nil
 }
 
 func (s *BoxService) NeedWIFIState() bool {

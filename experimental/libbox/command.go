@@ -14,6 +14,7 @@ const (
 	CommandSetClashMode
 	CommandGetSystemProxyStatus
 	CommandSetSystemProxyEnabled
+	CommandGroupInfoOnly
 	CommandConnections
 	CommandCloseConnection
 	CommandGetDeprecatedNotes

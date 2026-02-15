@@ -15,6 +15,19 @@ import (
 	"github.com/sagernet/sing/service"
 )
 
+func (c *CommandClient) handleSelectedGroupConn(conn net.Conn) {
+	defer conn.Close()
+
+	for {
+		groups, err := readGroups(conn)
+		if err != nil {
+			c.handler.Disconnected(err.Error())
+			return
+		}
+		c.handler.WriteGroups(groups)
+	}
+}
+
 func (c *CommandClient) handleGroupConn(conn net.Conn) {
 	defer conn.Close()
 
@@ -195,4 +208,92 @@ func (s *CommandServer) handleSetGroupExpand(conn net.Conn) error {
 		}
 	}
 	return writeError(conn, nil)
+}
+
+func (s *CommandServer) handleSelectedGroupConn(conn net.Conn) error {
+	var interval int64
+	err := binary.Read(conn, binary.BigEndian, &interval)
+	if err != nil {
+		return E.Cause(err, "read interval")
+	}
+	ticker := time.NewTicker(time.Duration(interval))
+	defer ticker.Stop()
+	ctx := connKeepAlive(conn)
+	writer := bufio.NewWriter(conn)
+	for {
+		service := s.service
+		if service != nil {
+			err = writeSelectedGroups(writer, service)
+			if err != nil {
+				return err
+			}
+		} else {
+			err = binary.Write(writer, binary.BigEndian, uint16(0))
+			if err != nil {
+				return err
+			}
+		}
+		err = writer.Flush()
+		if err != nil {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-s.urlTestUpdate:
+		}
+	}
+}
+
+func writeSelectedGroups(writer io.Writer, boxService *BoxService) error {
+	historyStorage := service.PtrFromContext[urltest.HistoryStorage](boxService.ctx)
+	cacheFile := service.FromContext[adapter.CacheFile](boxService.ctx)
+	outbounds := boxService.instance.Outbound().Outbounds()
+	var iGroups []adapter.OutboundGroup
+	for _, it := range outbounds {
+		if group, isGroup := it.(adapter.OutboundGroup); isGroup {
+			iGroups = append(iGroups, group)
+		}
+	}
+	var groups []OutboundGroup
+	for _, iGroup := range iGroups {
+		var _group OutboundGroup
+		_group.Tag = iGroup.Tag()
+		_group.Type = iGroup.Type()
+		_, _group.Selectable = iGroup.(*group.Selector)
+		_group.Selected = iGroup.Now()
+		if cacheFile != nil {
+			if isExpand, loaded := cacheFile.LoadGroupExpand(_group.Tag); loaded {
+				_group.IsExpand = isExpand
+			}
+		}
+
+		for _, itemTag := range iGroup.All() {
+			itemOutbound, isLoaded := boxService.instance.Outbound().Outbound(itemTag)
+			if !isLoaded {
+				continue
+			}
+			if itemTag != _group.Selected {
+				continue
+			}
+			var item OutboundGroupItem
+			item.Tag = itemTag
+			item.Type = itemOutbound.Type()
+			if history := historyStorage.LoadURLTestHistory(adapter.OutboundTag(itemOutbound)); history != nil {
+				item.URLTestTime = history.Time.Unix()
+				item.URLTestDelay = int32(history.Delay)
+			}
+			_group.ItemList = append(_group.ItemList, &item)
+		}
+		groups = append(groups, _group)
+		if len(_group.ItemList) < 2 {
+			continue
+		}
+	}
+	return varbin.Write(writer, binary.BigEndian, groups)
 }
